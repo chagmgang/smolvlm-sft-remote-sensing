@@ -107,6 +107,9 @@ def main():
         prefix='/nas/k8s/dev/mlops/vl-data/rsgpt/rsgpt_dataset/RSICap/images/',
         dataset=dataset_load,
     )
+    dataset_list.append(dataset)
+
+    dataset = torch.utils.data.ConcatDataset(dataset_list)
 
     collate_fn = CollateFn(processor=processor)
 
