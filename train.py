@@ -63,19 +63,27 @@ class CollateFn(object):
 
         batch = list(zip(*batch))
         filenames, chats = batch
-        assert len(filenames) == 1
-        assert len(chats) == 1
 
-        image = Image.open(filenames[0])
-        prompt = self.processor.apply_chat_template(chats[0])
-        encode = self.processor(
-            text=[prompt],
-            images=[[image]],
-            return_tensors='pt',
-        )
+        texts = list()        
+        for chat in chats:
+            text = self.processor.apply_chat_template(chat, tokenize=False)
+            texts.append(text)
 
-        encode['labels'] = encode['input_ids']
-        return encode
+        images = list()
+        for filename in filenames:
+            image = Image.open(filename).convert('RGB')
+            images.append(image)
+
+        batch = processor(text=texts, images=images, return_tensors='pt', padding=True)
+        labels = batch['input_ids'].clone()
+        labels[labels == self.processor.tokenizer.pad_token_id] = -100
+        image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
+            str(self.processor.image_token))
+        labels[labels == image_token_id] = -100
+
+        batch['labels'] = labels
+
+        return batch
 
 
 
@@ -117,8 +125,8 @@ def main():
         output_dir='smolvlm-500m-tuning/model',
         logging_dir='smolvlm-500m-tuning/logs',
         logging_steps=1,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=16,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
         weight_decay=0.05,
         learning_rate=5e-5,
         save_strategy='steps',
