@@ -1,10 +1,19 @@
+from PIL import Image
+import random
+import torchvision
+import numpy as np
+import os
+from datasets import load_dataset
+import torch
+from PIL import Image
+import random
 from transformers import SmolVLMForConditionalGeneration, Idefics3Processor
 from transformers import Trainer, TrainingArguments
 import torch
 
 import os
 
-from datasets import load_dataset
+from datasets import load_from_disk, load_dataset
 from PIL import Image
 
 import argparse
@@ -24,29 +33,93 @@ parser.add_argument('--model-path')
 parser = deepspeed.add_config_arguments(parser)
 
 
+def calc_num_options(class_name, candidates):
+    assert class_name in candidates
 
-class DatasetFromHuggingfaceHub(torch.utils.data.Dataset):
+    selected_idx = np.arange(len(candidates))
+    np.random.shuffle(selected_idx)
+
+    num_options = random.randint(3, len(candidates))
+    selected_idx = selected_idx[:num_options]
+    
+    selected_candidates = list()
+    for idx in selected_idx:
+        selected_candidates.append(candidates[idx])
+
+    selected_candidates.append(class_name)
+    selected_candidates = list(set(selected_candidates))
+    np.random.shuffle(selected_candidates)
+
+    prob = random.random()
+    if prob < float(1 / len(candidates)): # no option
+        selected_candidates = [s for s in selected_candidates if s != class_name]
+        class_name = 'no option'
+        rand_index = random.randint(0, len(selected_candidates))
+        selected_candidates.insert(rand_index, class_name)
+    else:
+        class_name = class_name
+        selected_candidates = selected_candidates
+    return class_name, selected_candidates
+
+
+def make_template(candidates, class_name):
+
+    templates = ''
+    for idx, candidate in enumerate(candidates):
+        template = f"<|reserved_special_token_{idx}|>"
+        template += '\n'
+        template += candidate
+        if idx != len(candidates) - 1:
+            template += '\n'
+        templates += template
+
+    index = candidates.index(class_name)
+    label_token = f"<|reserved_special_token_{index}|>"
+    return templates, label_token
+    
+
+class ClassificationDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
         prefix,
         dataset,
+        transforms,
     ):
-
         self.prefix = prefix
         self.dataset = dataset
-
-    def __getitem__(self, idx):
-        data = self.dataset[idx]
-        filename = data['filename']
-        chats = data['chats']
-        full_filename = os.path.join(self.prefix, filename)
-
-        return full_filename, chats
-
+        self.transforms = transforms
 
     def __len__(self):
         return len(self.dataset)
+
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        filename = os.path.join(self.prefix, data['images'])
+        image = Image.open(filename)
+        image = self.transforms(image)
+
+        class_name, candidates = calc_num_options(data['class'], data['candidates'])
+        human, assistant = make_template(candidates, class_name)
+
+        chats = [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'image'},
+                    {'type': 'text', 'text': 'You are an expert whose job is to analysis remote sensing imagery. Based on the images, choose the most appropriate category from the following.'},
+                    {'type': 'text', 'text': human},
+                ],
+            },
+            {
+                'role': 'Assistant',
+                'content': [
+                    {'type': 'text', 'text': assistant},
+                ],
+            },
+        ]
+
+        return image, chats
 
 
 class CollateFn(object):
@@ -60,9 +133,14 @@ class CollateFn(object):
         self.max_tokens = max_tokens
 
     def __call__(self, batch):
-
         batch = list(zip(*batch))
-        filenames, chats = batch
+        image_files, chats = batch
+
+        class_names = list()
+        for chat in chats:
+            class_names.append(chat[-1]['content'][0]['text'])
+
+        class_ids = [self.processor.tokenizer.convert_tokens_to_ids(c) for c in class_names]
 
         texts = list()        
         for chat in chats:
@@ -70,11 +148,10 @@ class CollateFn(object):
             texts.append(text)
 
         images = list()
-        for filename in filenames:
-            image = Image.open(filename).convert('RGB')
-            images.append(image)
+        for image_file in image_files:
+            images.append(image_file)
 
-        batch = processor(text=texts, images=images, return_tensors='pt', padding=True)
+        batch = self.processor(text=texts, images=images, return_tensors='pt', padding=True)
         labels = batch['input_ids'].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
         image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
@@ -85,54 +162,92 @@ class CollateFn(object):
 
         return batch
 
-
-
 def main():
 
     args = parser.parse_args()
 
-    model = SmolVLMForConditionalGeneration.from_pretrained(args.model_path)
+    model = SmolVLMForConditionalGeneration.from_pretrained('HuggingFaceTB/SmolVLM-256M-Instruct')
+    processor = Idefics3Processor.from_pretrained('HuggingFaceTB/SmolVLM-256M-Instruct')
 
-    processor = Idefics3Processor.from_pretrained(args.model_path)
+    transforms = torchvision.transforms.Compose([
+        torchvision.transforms.RandomHorizontalFlip(),
+        torchvision.transforms.RandomVerticalFlip(),
+    ])
 
+    dataset_loaded = load_from_disk('/nas/k8s/dev/mlops/chagmgang/FGSC')
+    dataset_config = {
+        'FGSCM_52': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data',
+            'multi': 10,
+        },
+        'FGSCR_42': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data',
+            'multi': 1,
+        },
+        'AiRound': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data/airound/aerial',
+            'multi': 10,
+        },
+        'CV_BrCT': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data/cvbrct/aerial',
+            'multi': 10,
+        },
+        'EuroSAT': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data/eurosat/2750',
+            'multi': 4,
+        },
+        'OPTINAL_31': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data/optimal-31/OPTIMAL-31/Images',
+            'multi': 50,
+        },
+        'RESISC': {
+            'prefix': '/nas/Dataset/NWPU-RESISC45/nwpu-rsisc45/NWPU-RESISC45',
+            'multi': 3,
+        },
+        'RSI_CB128': {
+            'prefix': '/nas/Dataset/rsi-cb128/RSI-CB128',
+            'multi': 3,
+        },
+        'UC_Merced': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data/UCMerced-Landuse/UCMerced_LandUse/Images',
+            'multi': 50,
+        },
+        'WHU_RS19': {
+            'prefix': '/nas/Dataset/WHU-RS19/WHU-RS19',
+            'multi': 100,
+        },
+        'mlrsnet': {
+            'prefix': '/nas/k8s/dev/mlops/vl-data/mlrsnet/Images',
+            'multi': 1,
+        },
+    }
+    
     dataset_list = list()
-    dataset_load = load_dataset('KevinCha/smolvlm-format-earthgpt')['train']
-    dataset = DatasetFromHuggingfaceHub(
-        prefix='/nas/k8s/dev/mlops/vl-data/MMRS-1M',
-        dataset=dataset_load,
-    )
-    dataset_list.append(dataset)
-
-    dataset_load = load_dataset('KevinCha/smolvlm-format-rsgpt-eval')['train']
-    dataset = DatasetFromHuggingfaceHub(
-        prefix='/nas/k8s/dev/mlops/vl-data/rsgpt/rsgpt_dataset/RSIEval/images/',
-        dataset=dataset_load,
-    )
-    dataset_list.append(dataset)
-
-    dataset_load = load_dataset('KevinCha/smolvlm-format-rsgpt-caption')['train']
-    dataset = DatasetFromHuggingfaceHub(
-        prefix='/nas/k8s/dev/mlops/vl-data/rsgpt/rsgpt_dataset/RSICap/images/',
-        dataset=dataset_load,
-    )
-    dataset_list.append(dataset)
-
+    for key in dataset_config.keys():
+        for _ in range(dataset_config[key]['multi']):
+            dataset = ClassificationDataset(
+                prefix=dataset_config[key]['prefix'],
+                dataset=dataset_loaded[key],
+                transforms=transforms,
+            )
+            dataset_list.append(dataset)
+    
     dataset = torch.utils.data.ConcatDataset(dataset_list)
 
     collate_fn = CollateFn(processor=processor)
 
     training_args = TrainingArguments(
-        output_dir='smolvlm-500m-tuning/model',
-        logging_dir='smolvlm-500m-tuning/logs',
+        output_dir='smolvlm-256m-tuning/model',
+        logging_dir='smolvlm-256m-tuning/logs',
         logging_steps=1,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=8,
         weight_decay=0.05,
-        learning_rate=5e-5,
+        learning_rate=1e-4,
         save_strategy='steps',
         save_steps=500,
-        warmup_steps=1000,
-        max_steps=33000,
+        warmup_steps=250,
+        max_steps=15000,
         deepspeed=args.deepspeed_config,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={
